@@ -1,10 +1,2 @@
 streamlit>=1.30
 pandas
-PyPDF2
-python-docx
-openpyxl
-python-pptx
-reportlab
-pytesseract
-Pillow
-pdf2image
