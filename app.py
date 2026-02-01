@@ -29,10 +29,6 @@ from PIL import Image
 import pdf2image
 import tempfile
 import os
-import zipfile
-import streamlit.components.v1 as components
-import sqlite3
-from pathlib import Path
 
 # Load configuration
 try:
@@ -523,9 +519,6 @@ def render_header():
 def render_cui_inspector():
     """Render CUI inspection interface"""
     st.header("📄 CUI Document Inspector")
-
-    autosave = st.toggle("Auto-save evidence to SQLite (recommended)", value=True)
-    uploaded_by = st.text_input("Uploaded/Run by (optional)", value="")
     st.info("""
     **Purpose:** Scan documents for Controlled Unclassified Information (CUI) to ensure proper handling per NIST SP 800-171.
     **Supported Formats:** PDF, Word (DOCX), Excel (XLSX), PowerPoint (PPTX), Text files (TXT, CSV, JSON, MD)
@@ -913,709 +906,214 @@ def render_cmmc_guidance():
         """)
 
 
-# -----------------------------
-# Evidence Vault: SQLite DB + Repo (content-addressed) + Versioned uploads
-# -----------------------------
-APP_VERSION = "cui-portal-1.0"
-INSPECTOR_VERSION = "cui-inspector-1.0"
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-REPO_DIR = DATA_DIR / "repo"
-DB_PATH = DATA_DIR / "evidence.db"
-
-def _now_iso() -> str:
-    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-
-def _sha256_bytes(b: bytes) -> str:
-    h = hashlib.sha256()
-    h.update(b)
-    return h.hexdigest()
-
-def _ensure_dirs():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    (REPO_DIR / "objects").mkdir(parents=True, exist_ok=True)
-    (REPO_DIR / "refs").mkdir(parents=True, exist_ok=True)
-
-def _db():
-    _ensure_dirs()
-    con = sqlite3.connect(str(DB_PATH))
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA foreign_keys = ON;")
-    return con
-
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS artifacts (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  logical_name TEXT NOT NULL UNIQUE,
-  created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS artifact_versions (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  artifact_id INTEGER NOT NULL,
-  version_int INTEGER NOT NULL,
-  original_filename TEXT NOT NULL,
-  object_relpath TEXT NOT NULL,
-  ref_relpath TEXT NOT NULL,
-  sha256 TEXT NOT NULL,
-  size_bytes INTEGER NOT NULL,
-  mime TEXT,
-  created_at TEXT NOT NULL,
-  uploaded_by TEXT,
-  UNIQUE(artifact_id, version_int),
-  FOREIGN KEY(artifact_id) REFERENCES artifacts(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS inspections (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  artifact_version_id INTEGER,
-  run_type TEXT NOT NULL,               -- single|bulk|qa
-  app_version TEXT NOT NULL,
-  inspector_version TEXT NOT NULL,
-  started_at TEXT NOT NULL,
-  finished_at TEXT NOT NULL,
-  cui_detected INTEGER,
-  risk_level TEXT,
-  patterns_json TEXT,
-  categories_json TEXT,
-  summary_json TEXT,
-  error TEXT,
-  FOREIGN KEY(artifact_version_id) REFERENCES artifact_versions(id) ON DELETE SET NULL
-);
-
-CREATE TABLE IF NOT EXISTS evidence_files (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  inspection_id INTEGER NOT NULL,
-  kind TEXT NOT NULL,                   -- findings_json|report_pdf|summary_csv|outputs_zip|qa_csv|certificate_pdf
-  object_relpath TEXT NOT NULL,
-  filename TEXT NOT NULL,
-  sha256 TEXT NOT NULL,
-  size_bytes INTEGER NOT NULL,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY(inspection_id) REFERENCES inspections(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_inspections_started_at ON inspections(started_at);
-CREATE INDEX IF NOT EXISTS idx_artifact_versions_sha256 ON artifact_versions(sha256);
-CREATE INDEX IF NOT EXISTS idx_evidence_files_sha256 ON evidence_files(sha256);
-"""
-
-def init_evidence_store():
-    con = _db()
-    try:
-        con.executescript(SCHEMA_SQL)
-        con.commit()
-    finally:
-        con.close()
-
-def normalize_logical_name(filename: str) -> str:
-    # stable logical grouping (strip dirs, collapse whitespace, lower)
-    base = os.path.basename(filename or "document")
-    return re.sub(r"\s+", " ", base).strip().lower()
-
-def _object_path_for_hash(sha256: str) -> Path:
-    return REPO_DIR / "objects" / sha256[:2] / sha256
-
-def repo_store_object(data: bytes) -> str:
-    """
-    Store bytes in content-addressed object store if not present.
-    Returns relative path from REPO_DIR.
-    """
-    _ensure_dirs()
-    sha = _sha256_bytes(data)
-    obj_path = _object_path_for_hash(sha)
-    obj_path.parent.mkdir(parents=True, exist_ok=True)
-    if not obj_path.exists():
-        with open(obj_path, "wb") as f:
-            f.write(data)
-    rel = obj_path.relative_to(REPO_DIR).as_posix()
-    return rel
-
-def repo_write_ref(artifact_id: int, version_int: int, original_filename: str, data: bytes) -> str:
-    """
-    Write a human-friendly versioned copy under repo/refs for browsing.
-    Returns relative path from REPO_DIR.
-    """
-    _ensure_dirs()
-    safe_name = re.sub(r"[^a-zA-Z0-9._-]+", "_", os.path.basename(original_filename))
-    ref_dir = REPO_DIR / "refs" / f"artifact_{artifact_id}" / f"v{version_int:04d}"
-    ref_dir.mkdir(parents=True, exist_ok=True)
-    ref_path = ref_dir / safe_name
-    # Overwrite is fine; version folder is immutable by policy but file write is idempotent
-    with open(ref_path, "wb") as f:
-        f.write(data)
-    return ref_path.relative_to(REPO_DIR).as_posix()
-
-def upsert_artifact_and_version(filename: str, data: bytes, mime: str = None, uploaded_by: str = None) -> int:
-    """
-    Create/lookup artifact by logical name; add a new version if content differs from latest.
-    Returns artifact_version_id.
-    """
-    init_evidence_store()
-    logical = normalize_logical_name(filename)
-    sha = _sha256_bytes(data)
-    size = len(data)
-
-    con = _db()
-    try:
-        cur = con.cursor()
-        # ensure artifact row
-        cur.execute("SELECT id FROM artifacts WHERE logical_name = ?", (logical,))
-        row = cur.fetchone()
-        if row:
-            artifact_id = int(row["id"])
-        else:
-            cur.execute("INSERT INTO artifacts (logical_name, created_at) VALUES (?, ?)", (logical, _now_iso()))
-            artifact_id = cur.lastrowid
-
-        # check latest version hash
-        cur.execute("""
-            SELECT id, version_int, sha256 FROM artifact_versions
-            WHERE artifact_id = ?
-            ORDER BY version_int DESC
-            LIMIT 1
-        """, (artifact_id,))
-        last = cur.fetchone()
-        if last and last["sha256"] == sha:
-            return int(last["id"])  # no new version
-
-        next_ver = 1 if not last else int(last["version_int"]) + 1
-
-        obj_rel = repo_store_object(data)
-        ref_rel = repo_write_ref(artifact_id, next_ver, filename, data)
-
-        cur.execute("""
-            INSERT INTO artifact_versions
-            (artifact_id, version_int, original_filename, object_relpath, ref_relpath, sha256, size_bytes, mime, created_at, uploaded_by)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (artifact_id, next_ver, os.path.basename(filename), obj_rel, ref_rel, sha, size, mime, _now_iso(), uploaded_by))
-        av_id = cur.lastrowid
-        con.commit()
-        return int(av_id)
-    finally:
-        con.close()
-
-def save_inspection(artifact_version_id: int, run_type: str, findings: Dict, started_at: str, finished_at: str) -> int:
-    """
-    Persist inspection summary (not the full raw text) into SQLite.
-    Returns inspection_id.
-    """
-    init_evidence_store()
-    con = _db()
-    try:
-        cur = con.cursor()
-        cur.execute("""
-            INSERT INTO inspections
-            (artifact_version_id, run_type, app_version, inspector_version, started_at, finished_at,
-             cui_detected, risk_level, patterns_json, categories_json, summary_json, error)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            artifact_version_id,
-            run_type,
-            APP_VERSION,
-            INSPECTOR_VERSION,
-            started_at,
-            finished_at,
-            1 if findings.get("cui_detected") else 0 if findings.get("cui_detected") is not None else None,
-            findings.get("risk_level"),
-            json.dumps(findings.get("patterns_found", {})),
-            json.dumps(findings.get("cui_categories", [])),
-            json.dumps({
-                "filename": findings.get("filename"),
-                "risk_score": findings.get("risk_score"),
-                "summary": findings.get("summary"),
-                "recommendations_count": len(findings.get("recommendations", []) or []),
-            }),
-            findings.get("error")
-        ))
-        ins_id = cur.lastrowid
-        con.commit()
-        return int(ins_id)
-    finally:
-        con.close()
-
-def attach_evidence_file(inspection_id: int, kind: str, filename: str, data: bytes) -> int:
-    """
-    Store evidence output bytes into repo objects + record in db.
-    """
-    init_evidence_store()
-    obj_rel = repo_store_object(data)
-    sha = _sha256_bytes(data)
-    size = len(data)
-    con = _db()
-    try:
-        cur = con.cursor()
-        cur.execute("""
-            INSERT INTO evidence_files
-            (inspection_id, kind, object_relpath, filename, sha256, size_bytes, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        """, (inspection_id, kind, obj_rel, os.path.basename(filename), sha, size, _now_iso()))
-        eid = cur.lastrowid
-        con.commit()
-        return int(eid)
-    finally:
-        con.close()
-
-def repo_read_object(relpath: str) -> bytes:
-    p = REPO_DIR / relpath
-    with open(p, "rb") as f:
-        return f.read()
-
-def list_recent_inspections(limit: int = 50):
-    init_evidence_store()
-    con = _db()
-    try:
-        cur = con.cursor()
-        cur.execute("""
-            SELECT i.id, i.run_type, i.started_at, i.finished_at, i.cui_detected, i.risk_level,
-                   av.original_filename, av.version_int, a.logical_name
-            FROM inspections i
-            LEFT JOIN artifact_versions av ON i.artifact_version_id = av.id
-            LEFT JOIN artifacts a ON av.artifact_id = a.id
-            ORDER BY i.started_at DESC
-            LIMIT ?
-        """, (limit,))
-        return [dict(r) for r in cur.fetchall()]
-    finally:
-        con.close()
-
-def list_evidence_files_for_inspection(inspection_id: int):
-    init_evidence_store()
-    con = _db()
-    try:
-        cur = con.cursor()
-        cur.execute("""
-            SELECT id, kind, filename, object_relpath, sha256, size_bytes, created_at
-            FROM evidence_files
-            WHERE inspection_id = ?
-            ORDER BY created_at DESC
-        """, (inspection_id,))
-        return [dict(r) for r in cur.fetchall()]
-    finally:
-        con.close()
-
-def render_evidence_vault():
-    st.header("🗄️ Evidence Vault (SQLite + Repo + Versioning)")
-    st.caption("Every upload and inspection run is stored with hashes + timestamps. Use this page to browse, export, and retrieve evidence.")
+def render_login():
+    st.header("🔐 Sign in")
     init_evidence_store()
 
-    # quick stats
-    con = _db()
-    try:
-        cur = con.cursor()
-        cur.execute("SELECT COUNT(*) AS n FROM artifacts")
-        a_n = int(cur.fetchone()["n"])
-        cur.execute("SELECT COUNT(*) AS n FROM artifact_versions")
-        v_n = int(cur.fetchone()["n"])
-        cur.execute("SELECT COUNT(*) AS n FROM inspections")
-        i_n = int(cur.fetchone()["n"])
-        cur.execute("SELECT COUNT(*) AS n FROM evidence_files")
-        e_n = int(cur.fetchone()["n"])
-    finally:
-        con.close()
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Artifacts", a_n)
-    c2.metric("Versions", v_n)
-    c3.metric("Inspections", i_n)
-    c4.metric("Evidence Files", e_n)
-
-    st.divider()
-    st.subheader("Recent inspections")
-    rows = list_recent_inspections(limit=100)
-    if not rows:
-        st.info("No inspections have been saved yet. Run the inspector or bulk runner to populate the vault.")
+    user_count = _ensure_admin_bootstrap()
+    if user_count == 0:
+        st.warning("No users exist yet. Create the first admin account to bootstrap access.")
+        with st.form("bootstrap_admin"):
+            username = st.text_input("Admin username", value="admin")
+            password = st.text_input("Admin password", type="password")
+            password2 = st.text_input("Confirm password", type="password")
+            submitted = st.form_submit_button("Create admin")
+        if submitted:
+            if not username or not password or password != password2:
+                st.error("Please provide a username and matching passwords.")
+                return
+            con = _db()
+            try:
+                con.execute(
+                    "INSERT INTO users (username, password_hash, role, is_active, created_at) VALUES (?, ?, 'admin', 1, ?)",
+                    (username.strip().lower(), _pbkdf2_hash(password), _now_iso())
+                )
+                con.commit()
+            finally:
+                con.close()
+            _audit("user_create", {"username": username, "role": "admin", "bootstrap": True})
+            st.success("Admin created. Please sign in.")
+            st.rerun()
         return
 
-    df = pd.DataFrame(rows)
+    with st.form("login_form"):
+        username = st.text_input("Username").strip().lower()
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in")
+    if submitted:
+        con = _db()
+        try:
+            r = con.execute("SELECT id, username, password_hash, role, is_active FROM users WHERE username = ?", (username,)).fetchone()
+            if not r or int(r["is_active"]) != 1 or not _pbkdf2_verify(password, r["password_hash"]):
+                _audit("login_fail", {"username": username})
+                st.error("Invalid credentials.")
+                return
+            con.execute("UPDATE users SET last_login_at = ? WHERE id = ?", (_now_iso(), int(r["id"])))
+            con.commit()
+            st.session_state["auth_user"] = {"id": int(r["id"]), "username": r["username"], "role": r["role"]}
+            _audit("login_success", {"username": r["username"], "role": r["role"]})
+            st.success("Signed in.")
+            st.rerun()
+        finally:
+            con.close()
+
+def render_logout_button():
+    u = _current_user()
+    if u:
+        st.sidebar.markdown(f"**Signed in:** {u['username']} ({u['role']})")
+        if st.sidebar.button("Sign out"):
+            _audit("logout", {"username": u["username"]})
+            st.session_state.pop("auth_user", None)
+            st.rerun()
+
+def render_audit_log():
+    st.header("🧾 Audit Log")
+    init_evidence_store()
+    limit = st.slider("Rows", 50, 500, 200, step=50)
+    con = _db()
+    try:
+        rows = con.execute("""
+            SELECT ae.id, ae.created_at, ae.event_type, u.username, ae.details_json
+            FROM audit_events ae
+            LEFT JOIN users u ON u.id = ae.user_id
+            ORDER BY ae.created_at DESC
+            LIMIT ?
+        """, (limit,)).fetchall()
+        df = pd.DataFrame([dict(r) for r in rows])
+    finally:
+        con.close()
     st.dataframe(df, use_container_width=True)
 
-    sel = st.selectbox("Select an inspection_id to view evidence files", options=[r["id"] for r in rows])
-    files = list_evidence_files_for_inspection(sel)
-    if files:
-        fdf = pd.DataFrame(files)
-        st.dataframe(fdf, use_container_width=True)
+        # Auto-save QA run
+        if st.session_state.get('autosave_qa', True):
+            qa_findings = {'cui_detected': None, 'risk_level': 'QA', 'patterns_found': {}, 'cui_categories': [], 'summary': f"QA run on {len(df)} file(s)", 'recommendations': []}
+            qa_ins_id = save_inspection(None, run_type='qa', findings=qa_findings, started_at=_now_iso(), finished_at=_now_iso())
+            attach_evidence_file(qa_ins_id, 'qa_csv', 'qa_results.csv', df.to_csv(index=False).encode('utf-8'))
+            _audit('qa_run', {'inspection_id': qa_ins_id, 'count': int(len(df))})
 
-        st.subheader("Download evidence files")
-        for f in files:
-            data = repo_read_object(f["object_relpath"])
-            st.download_button(
-                f'⬇️ {f["kind"]}: {f["filename"]} (sha256 {f["sha256"][:10]}...)',
-                data=data,
-                file_name=f["filename"],
-                mime="application/octet-stream"
-            )
-    else:
-        st.warning("No evidence files attached to this inspection yet.")
+    st.download_button("⬇️ Download audit log CSV", data=df.to_csv(index=False).encode("utf-8"),
+                       file_name=f"audit_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
 
+def render_user_admin():
+    st.header("👤 User Administration")
+    if not _is_admin():
+        st.error("Admins only.")
+        return
+    init_evidence_store()
 
-# -----------------------------
-# Add-ons: Test Bundle + QA + Training + Mapping
-# -----------------------------
-
-BUNDLE_PATH = os.path.join(os.path.dirname(__file__), "CUI_Full_Test_Bundle.zip")
-SAMPLE_DOCS = {
-    "CUI_Mismarked.docx": "CUI_Mismarked.docx",
-    "Mixed_CUI_NonCUI.docx": "Mixed_CUI_NonCUI.docx",
-    "CUI_Handling_SOP.docx": "CUI_Handling_SOP.docx",
-    "CUI_CMMC_L2_Mapping.xlsx": "CUI_CMMC_L2_Mapping.xlsx",
-    "CUI_Training_Slides.pdf": "CUI_Training_Slides.pdf",
-}
-
-def _local_sample_path(filename: str) -> str:
-    return os.path.join(os.path.dirname(__file__), filename)
-
-def _read_bytes(path: str) -> bytes:
-    with open(path, "rb") as f:
-        return f.read()
-
-def _zip_bytes(file_map: Dict[str, bytes]) -> bytes:
-    """Return a zip as bytes from {name: data}"""
-    buf = BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for name, data in file_map.items():
-            z.writestr(name, data)
-    buf.seek(0)
-    return buf.read()
-
-def _render_pdf_inline(pdf_bytes: bytes, height: int = 800):
-    """Embed PDF in Streamlit via base64 iframe."""
-    b64 = base64.b64encode(pdf_bytes).decode("utf-8")
-    html = f"""
-    <iframe src="data:application/pdf;base64,{b64}" width="100%" height="{height}" type="application/pdf"></iframe>
-    """
-    st.components.v1.html(html, height=height, scrolling=True)
-
-def _generate_training_certificate_pdf(name: str, score: int, total: int) -> bytes:
-    """Generate a simple completion certificate PDF."""
-    from reportlab.lib.pagesizes import letter
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.units import inch
-    from reportlab.lib import colors
-
-    buf = BytesIO()
-    c = canvas.Canvas(buf, pagesize=letter)
-    w, h = letter
-
-    # Border
-    c.setStrokeColor(colors.HexColor("#1f77b4"))
-    c.setLineWidth(3)
-    c.rect(0.6*inch, 0.6*inch, w-1.2*inch, h-1.2*inch)
-
-    c.setFont("Helvetica-Bold", 24)
-    c.drawCentredString(w/2, h-1.5*inch, "Certificate of Completion")
-
-    c.setFont("Helvetica", 12)
-    c.drawCentredString(w/2, h-2.1*inch, "CUI Handling & Marking Training")
-
-    c.setFont("Helvetica-Bold", 18)
-    c.drawCentredString(w/2, h-3.0*inch, name.strip() if name.strip() else "Participant")
-
-    c.setFont("Helvetica", 12)
-    c.drawCentredString(w/2, h-3.6*inch, f"Score: {score}/{total}")
-
-    c.setFont("Helvetica", 11)
-    c.drawCentredString(w/2, h-4.2*inch, "This certificate acknowledges successful completion of the training module.")
-
-    c.setFont("Helvetica-Oblique", 10)
-    issued = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    c.drawString(0.9*inch, 0.9*inch, f"Issued: {issued}")
-    c.drawRightString(w-0.9*inch, 0.9*inch, "Authorized Signature: ____________________")
-
-    c.showPage()
-    c.save()
-    buf.seek(0)
-    return buf.read()
-
-def _mismarking_checks(text: str) -> Dict[str, any]:
-    """
-    Lightweight QA for potential CUI marking issues.
-    Rules (heuristic):
-      - If CUI indicators (PII/Export/Contract/etc) are found but no explicit CUI marking -> possible UNDER-marked.
-      - If explicit CUI marking appears but no other indicators -> possible OVER-marked.
-      - Look for mixture: 'CUI' + 'Public' or 'Unclassified' in same doc -> conflicting marking.
-    """
-    indicators = {}
-    for k, pattern in CUI_PATTERNS.items():
-        indicators[k] = len(re.findall(pattern, text, re.IGNORECASE))
-
-    explicit = indicators.get("CUI_MARKING", 0) > 0
-    substantive = sum(v for k, v in indicators.items() if k != "CUI_MARKING") > 0
-
-    flags = []
-    if substantive and not explicit:
-        flags.append("Possible UNDER-marked: indicators found but no explicit CUI marking.")
-    if explicit and not substantive:
-        flags.append("Possible OVER-marked: explicit CUI marking present with few/no indicators detected.")
-    if re.search(r"\b(PUBLIC|UNCLASSIFIED)\b", text, re.IGNORECASE) and explicit:
-        flags.append("Conflicting marking: 'CUI' appears alongside PUBLIC/UNCLASSIFIED language.")
-
-    return {
-        "explicit_cui_marking": explicit,
-        "indicator_counts": indicators,
-        "flags": flags
-    }
-
-def render_test_bundle_runner():
-    st.header("🧪 Test Bundle Runner")
-    st.info("""
-    **Purpose:** Quickly validate your CUI inspection + evidence workflows using a packaged test bundle.
-    - Run bulk inspection against the included sample docs
-    - Export consolidated CSV/JSON + per-file PDF reports
-    - Download the full bundle for third‑party assessor testing
-    """)
-
-    # Bundle download
-    if os.path.exists(BUNDLE_PATH):
-        st.download_button(
-            "⬇️ Download Full Test Bundle (ZIP)",
-            data=_read_bytes(BUNDLE_PATH),
-            file_name="CUI_Full_Test_Bundle.zip",
-            mime="application/zip"
-        )
-
-    # Show sample docs downloads
-    st.subheader("📦 Included sample artifacts")
-    cols = st.columns(3)
-    i = 0
-    for label, filename in SAMPLE_DOCS.items():
-        p = _local_sample_path(filename)
-        if os.path.exists(p):
-            with cols[i % 3]:
-                st.download_button(
-                    f"⬇️ {label}",
-                    data=_read_bytes(p),
-                    file_name=label,
-                    mime="application/octet-stream"
+    st.subheader("Create user")
+    with st.form("create_user"):
+        username = st.text_input("Username").strip().lower()
+        role = st.selectbox("Role", ["viewer", "analyst", "admin"])
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Create")
+    if submitted:
+        if not username or not password:
+            st.error("Username and password required.")
+        else:
+            con = _db()
+            try:
+                con.execute(
+                    "INSERT INTO users (username, password_hash, role, is_active, created_at) VALUES (?, ?, ?, 1, ?)",
+                    (username, _pbkdf2_hash(password), role, _now_iso())
                 )
-        i += 1
+                con.commit()
+            finally:
+                con.close()
+            _audit("user_create", {"username": username, "role": role})
+            st.success("User created.")
 
     st.divider()
-    st.subheader("🚀 Run bulk inspection on included docs")
-    inspector = CUIInspector()
+    st.subheader("Manage users")
+    con = _db()
+    try:
+        rows = con.execute("SELECT id, username, role, is_active, created_at, last_login_at FROM users ORDER BY created_at DESC").fetchall()
+        df = pd.DataFrame([dict(r) for r in rows])
+    finally:
+        con.close()
+    st.dataframe(df, use_container_width=True)
 
-    if st.button("Run on included docs", type="primary"):
-        results = []
-        pdf_reports = {}
-        json_reports = {}
-
-        for label, filename in SAMPLE_DOCS.items():
-            p = _local_sample_path(filename)
-            if not os.path.exists(p):
-                continue
-            # For PDFs/DOCX/XLSX we can open as bytes and pass BytesIO into inspector
-            data = _read_bytes(p)
-            bio = BytesIO(data)
-            findings = inspector.inspect_file(bio, label)
-            results.append(findings)
-            json_reports[f"{label}.json"] = json.dumps(findings, indent=2).encode("utf-8")
-
-            # PDF report (skip if error)
-            if findings.get("risk_level") != "ERROR":
+    sel = st.selectbox("Select user_id", options=df["id"].tolist() if not df.empty else [])
+    if sel:
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Disable user"):
+                con = _db()
                 try:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-                        inspector.generate_cui_report_pdf(findings, tmp_pdf.name)
-                        with open(tmp_pdf.name, "rb") as f:
-                            pdf_reports[f"reports/{label}.pdf"] = f.read()
-                    os.unlink(tmp_pdf.name)
-                except Exception as e:
-                    pass
+                    con.execute("UPDATE users SET is_active = 0 WHERE id = ?", (int(sel),))
+                    con.commit()
+                finally:
+                    con.close()
+                _audit("user_disable", {"user_id": int(sel)})
+                st.success("User disabled.")
+                st.rerun()
+        with col2:
+            with st.form("reset_pw"):
+                new_pw = st.text_input("New password", type="password")
+                ok = st.form_submit_button("Reset password")
+            if ok:
+                if not new_pw:
+                    st.error("Password required.")
+                else:
+                    con = _db()
+                    try:
+                        con.execute("UPDATE users SET password_hash = ? WHERE id = ?", (_pbkdf2_hash(new_pw), int(sel)))
+                        con.commit()
+                    finally:
+                        con.close()
+                    _audit("password_reset", {"user_id": int(sel)})
+                    st.success("Password reset.")
 
-        if results:
-            st.success(f"Completed bulk run on {len(results)} artifact(s).")
-            # Summary dataframe
-            summary = []
-            for r in results:
-                summary.append({
-                    "filename": r.get("filename"),
-                    "cui_detected": r.get("cui_detected"),
-                    "risk_level": r.get("risk_level"),
-                    "patterns_total": sum(r.get("patterns_found", {}).values()),
-                    "categories": "; ".join(sorted(set(r.get("cui_categories", [])))),
-                    "error": r.get("error", "")
-                })
-            df = pd.DataFrame(summary)
-            st.dataframe(df, use_container_width=True)
-
-            # Downloads: consolidated CSV + zip of evidence
-                        if st.session_state.get('autosave_bulk', True):
-                # Save a bulk run inspection record (no single artifact_version_id)
-                bulk_findings = {
-                    'cui_detected': None,
-                    'risk_level': 'BULK',
-                    'patterns_found': {},
-                    'cui_categories': [],
-                    'risk_score': None,
-                    'summary': f"Bulk run on {len(results)} artifacts",
-                    'recommendations': [],
-                }
-                bulk_ins_id = save_inspection(None, run_type='bulk', findings=bulk_findings, started_at=_now_iso(), finished_at=_now_iso())
-                attach_evidence_file(bulk_ins_id, 'summary_csv', 'bulk_summary.csv', df.to_csv(index=False).encode('utf-8'))
-            
-            st.download_button(
-                "⬇️ Download Summary CSV",
-                data=df.to_csv(index=False).encode("utf-8"),
-                file_name=f"cui_bulk_summary_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
-            )
-
-            bundle_zip = _zip_bytes({**json_reports, **pdf_reports})
-            if st.session_state.get('autosave_bulk', True):
-                try:
-                    attach_evidence_file(bulk_ins_id, 'outputs_zip', 'bulk_outputs.zip', bundle_zip)
-                except Exception:
-                    pass
-
-            st.download_button(
-                "⬇️ Download Bulk Run Outputs (ZIP)",
-                data=bundle_zip,
-                file_name=f"cui_bulk_outputs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip",
-                mime="application/zip"
-            )
-
-def render_cui_marking_qa():
-    st.header("📑 CUI Marking QA (Under/Over/Conflicting)")
-    st.info("""
-    **Purpose:** Spot likely marking mistakes in documents:
-    - **Under‑marked:** indicators present without explicit CUI marking
-    - **Over‑marked:** explicit CUI marking with no indicators
-    - **Conflicting:** CUI appears alongside PUBLIC/UNCLASSIFIED wording
-
-    This is heuristic QA intended for workflow testing.
-    """)
-
-    inspector = CUIInspector()
-    uploaded = st.file_uploader(
-        "Upload document(s) for marking QA",
-        accept_multiple_files=True,
-        type=['txt','csv','json','md','pdf','docx','doc','xlsx','xls','pptx','ppt']
-    )
-
-    if st.button("Run marking QA"):
-        if not uploaded:
-            st.warning("Upload at least one file.")
+def render_search():
+    st.header("🔎 Search Evidence (safe excerpts + metadata)")
+    st.caption("Searches do not store full document text—only redacted excerpts and metadata.")
+    q = st.text_input("Search query (filename or excerpt)", "")
+    risk = st.selectbox("Risk level filter", ["Any", "LOW", "MEDIUM", "HIGH", "ERROR", "BULK"])
+    if st.button("Search", type="primary"):
+        if not q.strip():
+            st.warning("Enter a query.")
             return
-
-        outputs = []
-        for f in uploaded:
-            # Extract text using inspector's extractor
-            try:
-                bio = BytesIO(f.read())
-                # Need filename for filetype routing; reuse inspector internals
-                text = inspector.extract_text_from_file(bio, f.name)
-                qa = _mismarking_checks(text)
-                outputs.append({
-                    "filename": f.name,
-                    "explicit_cui_marking": qa["explicit_cui_marking"],
-                    "flags": " | ".join(qa["flags"]) if qa["flags"] else "",
-                    **{k: v for k, v in qa["indicator_counts"].items()}
-                })
-            except Exception as e:
-                outputs.append({"filename": f.name, "error": str(e)})
-
-        df = pd.DataFrame(outputs)
+        df = search_index(q, risk=risk, limit=500)
+        _audit("search", {"query": q, "risk": risk, "rows": int(len(df))})
         st.dataframe(df, use_container_width=True)
+        st.download_button("⬇️ Download results CSV", data=df.to_csv(index=False).encode("utf-8"),
+                           file_name=f"search_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
 
-        st.download_button(
-            "⬇️ Download QA Results (CSV)",
-            data=df.to_csv(index=False).encode("utf-8"),
-            file_name=f"cui_marking_qa_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
-        )
-
-def render_cmmc_mapping_explorer():
-    st.header("🧩 CMMC Level 2 Mapping Explorer")
-    st.info("""
-    **Purpose:** Browse and filter the provided CUI ↔ CMMC L2 mapping sheet.
-    Use this to trace findings/recommendations back to practices for evidence packaging.
-    """)
-    p = _local_sample_path("CUI_CMMC_L2_Mapping.xlsx")
-    if not os.path.exists(p):
-        st.error("Mapping file not found next to app.py")
+def render_diff():
+    st.header("🧮 Artifact Diff (latest vs previous)")
+    init_evidence_store()
+    con = _db()
+    try:
+        names = [r["logical_name"] for r in con.execute("SELECT logical_name FROM artifacts ORDER BY created_at DESC").fetchall()]
+    finally:
+        con.close()
+    if not names:
+        st.info("No artifacts yet. Upload and inspect a document first.")
         return
+    logical = st.selectbox("Select artifact (logical name)", options=names)
+    if st.button("Compute diff", type="primary"):
+        d = diff_versions(logical)
+        _audit("diff", {"logical_name": logical, "error": d.get("error")})
+        if d.get("error"):
+            st.error(d["error"])
+            return
+        st.json(d)
 
-    wb = openpyxl.load_workbook(p)
-    sheet = wb[wb.sheetnames[0]]
-    rows = list(sheet.iter_rows(values_only=True))
-    header = [str(h) if h is not None else "" for h in rows[0]]
-    data = rows[1:]
-    df = pd.DataFrame(data, columns=header)
-
-    # Simple filter widgets (best-effort since column names can vary)
-    st.caption("Tip: If your sheet uses different column names, the free-text search will still work.")
-    q = st.text_input("Search (any column)", "")
-    if q.strip():
-        mask = df.apply(lambda row: row.astype(str).str.contains(q, case=False, na=False).any(), axis=1)
-        df_view = df[mask].copy()
-    else:
-        df_view = df
-
-    st.dataframe(df_view, use_container_width=True)
-
-    st.download_button(
-        "⬇️ Download Filtered Mapping (CSV)",
-        data=df_view.to_csv(index=False).encode("utf-8"),
-        file_name=f"cmmc_l2_mapping_filtered_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv"
-    )
-
-    st.download_button(
-        "⬇️ Download Original Mapping (XLSX)",
-        data=_read_bytes(p),
-        file_name="CUI_CMMC_L2_Mapping.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-
-def render_training_and_certificate():
-    st.header("🎓 Training + Certificate")
-    st.info("""
-    **Purpose:** Provide auditor-friendly evidence of workforce training completion for CUI handling/marking.
-    - View the training slides
-    - Complete a short quiz
-    - Generate a completion certificate PDF
-    """)
-
-    slides_path = _local_sample_path("CUI_Training_Slides.pdf")
-    if os.path.exists(slides_path):
-        st.subheader("📚 Training Slides")
-        pdf_bytes = _read_bytes(slides_path)
-        with st.expander("View slides inline", expanded=False):
-            _render_pdf_inline(pdf_bytes, height=900)
-        st.download_button("⬇️ Download Slides (PDF)", data=pdf_bytes, file_name="CUI_Training_Slides.pdf", mime="application/pdf")
-
-    st.subheader("📝 Quick Quiz")
-    name = st.text_input("Participant name (for certificate)", "")
-
-    # Simple quiz (keep deterministic)
-    questions = [
-        ("CUI should be protected according to contract, law, and policy requirements.", ["True", "False"], 0),
-        ("If a document contains CUI indicators but lacks any CUI marking, it may be:", ["Over-marked", "Under-marked", "Correctly marked"], 1),
-        ("For CUI in transit, recommended minimum is:", ["TLS 1.2+", "HTTP", "Telnet"], 0),
-        ("Audit logs are relevant evidence for which CMMC domain in this app’s recommendations?", ["AU", "PE", "MA"], 0),
-        ("If 'CUI' and 'PUBLIC' appear together, that is best described as:", ["Conflicting marking", "Encryption issue", "Normal"], 0),
-    ]
-
-    answers = []
-    for idx, (q, opts, correct) in enumerate(questions, 1):
-        ans = st.radio(f"{idx}. {q}", opts, index=0, key=f"quiz_{idx}")
-        answers.append((ans, opts[correct]))
-
-    if st.button("Grade quiz & generate certificate", type="primary"):
-        score = sum(1 for (a, c) in answers if a == c)
-        total = len(questions)
-        if score == total:
-            st.success(f"✅ Passed! Score: {score}/{total}")
+def render_verify_vault():
+    st.header("🧪 Verify Evidence Vault Integrity")
+    st.info("Recomputes SHA-256 for every stored object and compares to database records.")
+    if st.button("Verify vault now", type="primary"):
+        df = verify_evidence_vault()
+        _audit("verify_vault", {"rows": int(len(df))})
+        st.dataframe(df, use_container_width=True)
+        bad = df[df["status"] != "OK"]
+        if len(bad) == 0:
+            st.success("✅ All objects verified (OK).")
         else:
-            st.warning(f"⚠️ Score: {score}/{total} (You can retry; certificate still available for workflow testing.)")
-
-        cert = _generate_training_certificate_pdf(name or "Participant", score, total)
-        st.download_button(
-            "⬇️ Download Certificate (PDF)",
-            data=cert,
-            file_name=f"CUI_Training_Certificate_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
-            mime="application/pdf"
-        )
+            st.warning(f"⚠️ Issues found: {len(bad)} row(s) not OK.")
+        st.download_button("⬇️ Download verification CSV", data=df.to_csv(index=False).encode("utf-8"),
+                           file_name=f"vault_verify_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv", mime="text/csv")
 
 
 def main():
@@ -1630,14 +1128,7 @@ def main():
         st.markdown("### 🧭 Navigation")
         page = st.radio(
             "Select Function",
-            ["📄 CUI Document Inspector",
-             "🗺️ Data Flow Mapper",
-             "🧪 Test Bundle Runner",
-             "📑 CUI Marking QA",
-             "🧩 CMMC L2 Mapping Explorer",
-             "🎓 Training + Certificate",
-             "🗄️ Evidence Vault",
-             "📚 CMMC Guidance"],
+            ['📄 CUI Document Inspector', '🗺️ Data Flow Mapper', '🧪 Test Bundle Runner', '📑 CUI Marking QA', '🧩 CMMC L2 Mapping Explorer', '🎓 Training + Certificate', '🗄️ Evidence Vault', '🧪 Verify Vault', '🔎 Search Evidence', '🧮 Artifact Diff', '🧾 Audit Log', '👤 User Admin', '📚 CMMC Guidance'],
             label_visibility="collapsed"
         )
         
@@ -1660,20 +1151,14 @@ def main():
         """)
     
     # Render selected page
+    if not _require_login():
+        render_login()
+        return
+
     if page == "📄 CUI Document Inspector":
         render_cui_inspector()
     elif page == "🗺️ Data Flow Mapper":
         render_data_flow_mapper()
-    elif page == "🧪 Test Bundle Runner":
-        render_test_bundle_runner()
-    elif page == "📑 CUI Marking QA":
-        render_cui_marking_qa()
-    elif page == "🧩 CMMC L2 Mapping Explorer":
-        render_cmmc_mapping_explorer()
-    elif page == "🎓 Training + Certificate":
-        render_training_and_certificate()
-    elif page == "🗄️ Evidence Vault":
-        render_evidence_vault()
     else:
         render_cmmc_guidance()
     
