@@ -1,22 +1,14 @@
-# CUI Streamlit Portal — Fixed + Enhanced (Evidence Vault v2)
+# Multi-tenant CUI Portal
 
-## What was fixed
-- Corrected an indentation/syntax issue in the bulk runner that prevented the app from starting.
+## Roles
+- superadmin: manage tenants, create tenant_admins, create auditors (cross-tenant), view all audit logs.
+- tenant_admin: manage users in their tenant.
+- auditor (read-only): may switch tenants and generate manifests/verify/search/diff (UI enforcement is best-effort).
+- analyst/viewer: tenant-bound.
 
-## New capabilities added
-1) Evidence vault integrity verification (SHA-256 recomputation vs DB).
-2) Full text/metadata search via `inspection_text_index` (stores redacted excerpt only).
-3) Artifact diff (latest vs previous versions: hash/size + inspection deltas).
-4) Role-based access with SQLite users table, login screen, admin user management, and audit log.
+## DB / Repo
+- SQLite: data/evidence_mt.db
+- Repo: data/repo/ (content-addressed objects + versioned refs)
 
-## Run
-pip install -r requirements.txt
-streamlit run app.py
-
-## First run
-If no users exist, the app will prompt you to create the first admin account.
-
-## Storage
-- SQLite: `data/evidence.db`
-- Repo objects: `data/repo/objects/<xx>/<sha256>`
-- Versioned refs: `data/repo/refs/artifact_<id>/v####/<filename>`
+## FedRAMP/CMMC Evidence Manifest
+Use 📦 Evidence Manifest to generate manifest.csv + hashes.sha256.txt (and optional objects/) in a ZIP.
