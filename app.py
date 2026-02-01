@@ -13,10 +13,44 @@ from typing import List, Dict, Tuple
 import base64
 from io import BytesIO
 import hashlib
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.utils import ImageReader
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib import colors
+from reportlab.lib.units import inch
 import PyPDF2
 from docx import Document
 import openpyxl
 from pptx import Presentation
+import pytesseract
+from PIL import Image
+import pdf2image
+import tempfile
+import os
+
+# Load configuration
+try:
+    from config import TESSERACT_CMD, POPPLER_PATH, OCR_DPI, OCR_LANGUAGE
+    # Set Tesseract command if specified in config
+    if TESSERACT_CMD:
+        pytesseract.pytesseract.tesseract_cmd = TESSERACT_CMD
+except ImportError:
+    # Default values if config.py not found
+    POPPLER_PATH = None
+    OCR_DPI = 300
+    OCR_LANGUAGE = 'eng'
+    # Try to auto-detect Tesseract on Windows
+    if os.name == 'nt':  # Windows
+        possible_paths = [
+            r'C:\Program Files\Tesseract-OCR\tesseract.exe',
+            r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe',
+        ]
+        for path in possible_paths:
+            if os.path.exists(path):
+                pytesseract.pytesseract.tesseract_cmd = path
+                break
 
 # Page configuration
 st.set_page_config(
@@ -62,15 +96,178 @@ class CUIInspector:
         self.findings = []
     
     def extract_text_from_pdf(self, file) -> str:
-        """Extract text from PDF file"""
+        """Extract text from PDF file with OCR fallback for scanned documents"""
+        text = ""
+        is_scanned = False
+        
         try:
+            # First, try standard text extraction with PyPDF2
             pdf_reader = PyPDF2.PdfReader(file)
-            text = ""
-            for page in pdf_reader.pages:
-                text += page.extract_text() + "\n"
-            return text
+            
+            for page_num, page in enumerate(pdf_reader.pages):
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+            
+            # Check if we got meaningful text (more than just whitespace/newlines)
+            if len(text.strip()) < 50:  # Threshold for likely scanned document
+                is_scanned = True
+                st.info(f"📸 Document appears to be scanned/image-based. Applying OCR...")
         except Exception as e:
-            raise Exception(f"Error extracting PDF text: {str(e)}")
+            st.warning(f"⚠️ Standard PDF extraction failed: {str(e)}. Trying OCR...")
+            is_scanned = True
+        
+        # If document is scanned or text extraction failed, use OCR
+        if is_scanned:
+            try:
+                # Reset file pointer
+                file.seek(0)
+                
+                # Create temporary file for pdf2image
+                with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_file:
+                    tmp_file.write(file.read())
+                    tmp_path = tmp_file.name
+                
+                try:
+                    # Convert PDF pages to images
+                    if POPPLER_PATH:
+                        images = pdf2image.convert_from_path(tmp_path, dpi=OCR_DPI, poppler_path=POPPLER_PATH)
+                    else:
+                        images = pdf2image.convert_from_path(tmp_path, dpi=OCR_DPI)
+                    
+                    # Apply OCR to each page
+                    ocr_text = ""
+                    progress_placeholder = st.empty()
+                    
+                    for idx, image in enumerate(images):
+                        progress_placeholder.text(f"🔍 OCR processing page {idx + 1}/{len(images)}...")
+                        page_text = pytesseract.image_to_string(image, lang=OCR_LANGUAGE)
+                        ocr_text += f"\n--- Page {idx + 1} ---\n{page_text}\n"
+                    
+                    progress_placeholder.empty()
+                    text = ocr_text if ocr_text.strip() else text
+                    
+                    if ocr_text.strip():
+                        st.success(f"✅ OCR completed: {len(images)} page(s) processed")
+                
+                finally:
+                    # Clean up temporary file
+                    if os.path.exists(tmp_path):
+                        os.unlink(tmp_path)
+                        
+            except Exception as ocr_error:
+                st.error(f"❌ OCR failed: {str(ocr_error)}")
+                if not text:
+                    raise Exception(f"Could not extract text from PDF: {str(ocr_error)}")
+        
+        if not text.strip():
+            raise Exception("No text could be extracted from PDF")
+        
+        return text
+    
+    def generate_cui_report_pdf(self, findings: Dict, output_path: str):
+        """Generate a PDF report of CUI findings using ReportLab"""
+        doc = SimpleDocTemplate(output_path, pagesize=letter)
+        story = []
+        styles = getSampleStyleSheet()
+        
+        # Custom styles
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=24,
+            textColor=colors.HexColor('#1f77b4'),
+            spaceAfter=30,
+            alignment=1  # Center
+        )
+        
+        heading_style = ParagraphStyle(
+            'CustomHeading',
+            parent=styles['Heading2'],
+            fontSize=14,
+            textColor=colors.HexColor('#2c3e50'),
+            spaceAfter=12,
+            spaceBefore=12
+        )
+        
+        # Title
+        story.append(Paragraph("🔒 CUI Inspection Report", title_style))
+        story.append(Spacer(1, 0.2*inch))
+        
+        # Document information
+        story.append(Paragraph(f"<b>Document:</b> {findings['filename']}", styles['Normal']))
+        story.append(Paragraph(f"<b>Inspection Date:</b> {findings['timestamp']}", styles['Normal']))
+        story.append(Paragraph(f"<b>CUI Detected:</b> {'Yes' if findings['cui_detected'] else 'No'}", styles['Normal']))
+        story.append(Paragraph(f"<b>Risk Level:</b> {findings['risk_level']}", styles['Normal']))
+        story.append(Spacer(1, 0.3*inch))
+        
+        # Risk level indicator
+        risk_colors_map = {
+            'LOW': colors.green,
+            'MEDIUM': colors.orange,
+            'HIGH': colors.red
+        }
+        risk_color = risk_colors_map.get(findings['risk_level'], colors.grey)
+        
+        risk_table = Table([[f"Risk Level: {findings['risk_level']}"]], colWidths=[6*inch])
+        risk_table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, -1), risk_color),
+            ('TEXTCOLOR', (0, 0), (-1, -1), colors.white),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 14),
+            ('PADDING', (0, 0), (-1, -1), 12),
+        ]))
+        story.append(risk_table)
+        story.append(Spacer(1, 0.3*inch))
+        
+        # Detected Patterns
+        if findings['patterns_found']:
+            story.append(Paragraph("Detected Patterns", heading_style))
+            pattern_data = [['Pattern Type', 'Occurrences']]
+            for pattern, count in findings['patterns_found'].items():
+                pattern_data.append([pattern, str(count)])
+            
+            pattern_table = Table(pattern_data, colWidths=[4*inch, 2*inch])
+            pattern_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#34495e')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, 0), 12),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.lightgrey])
+            ]))
+            story.append(pattern_table)
+            story.append(Spacer(1, 0.3*inch))
+        
+        # CUI Categories
+        if findings['cui_categories']:
+            story.append(Paragraph("CUI Categories Identified", heading_style))
+            for category in set(findings['cui_categories']):
+                story.append(Paragraph(f"• {category}", styles['Normal']))
+            story.append(Spacer(1, 0.3*inch))
+        
+        # Recommendations
+        story.append(Paragraph("CMMC Compliance Recommendations", heading_style))
+        for rec in findings['recommendations']:
+            # Remove emoji for PDF
+            rec_clean = re.sub(r'[^\x00-\x7F]+', '', rec)
+            story.append(Paragraph(f"• {rec_clean}", styles['Normal']))
+        
+        story.append(Spacer(1, 0.5*inch))
+        
+        # Footer
+        story.append(Paragraph(
+            "<i>This report assists with CMMC compliance documentation but does not replace professional assessment.</i>",
+            styles['Italic']
+        ))
+        
+        # Build PDF
+        doc.build(story)
+        return output_path
     
     def extract_text_from_docx(self, file) -> str:
         """Extract text from Word document"""
@@ -433,13 +630,41 @@ def render_cui_inspector():
                         st.markdown(f"- {rec}")
                     
                     # Export individual finding
-                    finding_json = json.dumps(finding, indent=2)
-                    st.download_button(
-                        label="📥 Download Finding Report (JSON)",
-                        data=finding_json,
-                        file_name=f"cui_finding_{finding['filename']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                        mime="application/json"
-                    )
+                    col1, col2 = st.columns(2)
+                    
+                    with col1:
+                        finding_json = json.dumps(finding, indent=2)
+                        st.download_button(
+                            label="📥 Download JSON Report",
+                            data=finding_json,
+                            file_name=f"cui_finding_{finding['filename']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                            mime="application/json",
+                            key=f"json_{finding['filename']}"
+                        )
+                    
+                    with col2:
+                        # Generate PDF report
+                        try:
+                            with tempfile.NamedTemporaryFile(delete=False, suffix='.pdf') as tmp_pdf:
+                                inspector.generate_cui_report_pdf(finding, tmp_pdf.name)
+                                tmp_pdf.seek(0)
+                                
+                                with open(tmp_pdf.name, 'rb') as pdf_file:
+                                    pdf_data = pdf_file.read()
+                                
+                                st.download_button(
+                                    label="📥 Download PDF Report",
+                                    data=pdf_data,
+                                    file_name=f"cui_report_{finding['filename']}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf",
+                                    mime="application/pdf",
+                                    key=f"pdf_{finding['filename']}"
+                                )
+                                
+                                # Clean up temp file
+                                if os.path.exists(tmp_pdf.name):
+                                    os.unlink(tmp_pdf.name)
+                        except Exception as e:
+                            st.error(f"Could not generate PDF report: {str(e)}")
         else:
             st.warning("⚠️ No documents to inspect. Please upload files or paste text.")
 
