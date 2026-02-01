@@ -1,14 +1,18 @@
-# Multi-tenant CUI Portal
+# CUI Inspector – Modular Multi-Tenant (Streamlit Cloud-safe)
 
-## Roles
-- superadmin: manage tenants, create tenant_admins, create auditors (cross-tenant), view all audit logs.
-- tenant_admin: manage users in their tenant.
-- auditor (read-only): may switch tenants and generate manifests/verify/search/diff (UI enforcement is best-effort).
-- analyst/viewer: tenant-bound.
+## Included feature updates (all 4)
+1. **Evidence integrity verification**: Verify Evidence Vault recomputes SHA-256 and compares to DB.
+2. **Full text / metadata search**: inspection_text_index stores safe excerpts + metadata for filtering.
+3. **Artifact diff + compare runs**: Compare Runs shows hash/risk/pattern/category deltas between two inspections.
+4. **Role-based access**: users table + login + audit trail + SuperAdmin + Tenant Admin + Auditor.
 
-## DB / Repo
-- SQLite: data/evidence_mt.db
-- Repo: data/repo/ (content-addressed objects + versioned refs)
+## Tenant Admin setup
+- SuperAdmin creates a tenant (Tenants page).
+- SuperAdmin goes to Users page, selects the tenant in sidebar, creates a user with role `tenant_admin`.
+- Tenant Admin logs in and can create `viewer` / `analyst` users for that tenant.
 
-## FedRAMP/CMMC Evidence Manifest
-Use 📦 Evidence Manifest to generate manifest.csv + hashes.sha256.txt (and optional objects/) in a ZIP.
+## Optional break-glass recovery (Streamlit Secrets)
+Set in Streamlit Cloud Secrets:
+SUPERADMIN_RECOVERY="ENABLED"
+SUPERADMIN_RECOVERY_PASSWORD="StrongPasswordHere"
+Remove secrets after recovery.

@@ -1,4 +1,3 @@
-
 import sys
 from pathlib import Path
 
@@ -9,7 +8,7 @@ if str(ROOT) not in sys.path:
 import streamlit as st
 from ui_pages import render_pages
 
-st.set_page_config(page_title="CUI Inspector (Modular)", layout="wide")
+st.set_page_config(page_title="CUI Inspector – Multi-Tenant", layout="wide")
 
 def main():
     st.title("CUI Inspector – Modular Multi-Tenant")
