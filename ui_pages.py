@@ -6,7 +6,15 @@ from inspector import render_inspector
 from evidence import render_evidence_vault, render_verify_evidence_vault
 from search import render_search
 from compare import render_compare
-from manifest import render_manifest_export
+
+# Import manifest safely
+try:
+    from manifest import render_manifest_export
+except Exception as e:
+    render_manifest_export = None
+    _manifest_import_error = str(e)
+else:
+    _manifest_import_error = None
 
 def render_pages():
     if not is_logged_in():
@@ -22,8 +30,11 @@ def render_pages():
         "✅ Verify Evidence Vault",
         "🔎 Search",
         "🧾 Compare Runs",
-        "📦 Evidence Manifest",
     ]
+
+    if render_manifest_export:
+        pages.append("📦 Evidence Manifest")
+
     if is_tenant_admin() or is_superadmin():
         pages.append("👥 Users")
     if is_superadmin():
@@ -42,7 +53,10 @@ def render_pages():
     elif page == "🧾 Compare Runs":
         render_compare()
     elif page == "📦 Evidence Manifest":
-        render_manifest_export()
+        if _manifest_import_error:
+            st.error(f"Manifest module failed to load: {_manifest_import_error}")
+        else:
+            render_manifest_export()
     elif page == "👥 Users":
         render_user_management()
     elif page == "🛡️ Tenants":
