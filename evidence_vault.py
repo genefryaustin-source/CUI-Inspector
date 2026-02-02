@@ -73,11 +73,16 @@ def render_evidence_vault():
             """, (r["id"],)).fetchall()
 
             st.subheader("Artifacts")
+
             for a in arts:
+                # 🔑 UNIQUE KEY FIX (this is the important part)
+                download_key = f"dl_{r['id']}_{a['name']}"
+
                 st.download_button(
-                    f"⬇ Download {a['name']}",
+                    label=f"⬇ Download {a['name']}",
                     data=a["content"],
-                    file_name=a["name"]
+                    file_name=a["name"],
+                    key=download_key
                 )
 
                 recomputed = hashlib.sha256(a["content"]).hexdigest()
@@ -87,4 +92,5 @@ def render_evidence_vault():
                     st.error("Hash mismatch")
 
     con.close()
+
 

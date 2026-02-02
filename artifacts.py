@@ -44,10 +44,15 @@ def artifacts_to_download_buttons(artifacts):
     if not artifacts:
         return
 
-    for name, data in artifacts.items():
+    # Use a stable prefix per render cycle
+    prefix = "artifact_dl"
+
+    for idx, (name, data) in enumerate(artifacts.items()):
         st.download_button(
-            f"⬇ Download {name}",
+            label=f"⬇ Download {name}",
             data=data,
-            file_name=name
+            file_name=name,
+            key=f"{prefix}_{idx}_{name}"
         )
+
 
