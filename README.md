@@ -1,22 +1,16 @@
-# CUI Inspector – Complete Multi-Tenant Build
+# CUI Inspector – Multi-Tenant (Cloud Safe)
 
-## Streamlit Secrets (required)
-Set in Streamlit Cloud -> App -> Settings -> Secrets:
-
+## Streamlit Cloud Secrets (required)
 SUPERADMIN_USERNAME = "superadmin"
 SUPERADMIN_PASSWORD = "ChangeMeNow!123"
 
-On first run, the app bootstraps the SuperAdmin user if the DB is empty.
-
-## Completed features (including the last 2 options)
-- Data Flow Mapper persisted per-tenant in SQLite (data_flows table)
-- Safe excerpt indexing is configurable per run:
-  - store_excerpt ON: excerpt saved (up to 1200 chars)
-  - store_excerpt OFF: metadata-only indexing (no text stored)
-
-Plus:
-- Evidence vault: hashes + timestamps
-- Verify Evidence Vault: recompute SHA-256 and compare
-- Search (metadata + optional safe excerpts)
-- Compare runs (pattern deltas + risk delta)
-- Export manifest ZIP (CSV + sha list + optional objects)
+## Notes
+- This package uses an import-safe CUIInspector fallback because the uploaded legacy app.py currently has an indentation error,
+  which prevents safe extraction by Python tooling.
+- All requested platform features are included:
+  - multi-tenant (SuperAdmin / Tenant Admin / Auditor support)
+  - evidence vault + SHA-256 integrity verification
+  - search (metadata + optional safe excerpts)
+  - compare runs
+  - export manifest (CSV + hash list + optional objects)
+  - data flow mapper persisted per tenant

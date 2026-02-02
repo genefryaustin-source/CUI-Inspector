@@ -1,5 +1,5 @@
 import streamlit as st
-from auth import require_login, render_logout_sidebar, is_superadmin, is_tenant_admin
+from auth import require_login, render_logout_sidebar, role, is_superadmin
 from tenants import render_tenant_selector_sidebar, render_superadmin_tenant_management
 from users import render_user_management
 from inspector import render_cui_inspector
@@ -12,7 +12,6 @@ from manifest import render_manifest_export
 def render_pages():
     if not require_login():
         return
-
     render_logout_sidebar()
     render_tenant_selector_sidebar()
 
@@ -25,7 +24,7 @@ def render_pages():
         "🧾 Compare Runs",
         "📦 Export Manifest",
     ]
-    if is_tenant_admin() or is_superadmin():
+    if role() in ("superadmin","tenant_admin"):
         pages.append("👥 Users")
     if is_superadmin():
         pages.append("🛡️ Tenants")

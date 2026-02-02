@@ -136,11 +136,6 @@ CREATE TABLE IF NOT EXISTS data_flows (
   created_by TEXT,
   FOREIGN KEY(tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
 );
-
-CREATE INDEX IF NOT EXISTS idx_inspections_tenant_started ON inspections(tenant_id, started_at);
-CREATE INDEX IF NOT EXISTS idx_evidence_tenant_inspection ON evidence_files(tenant_id, inspection_id);
-CREATE INDEX IF NOT EXISTS idx_index_tenant_created ON inspection_text_index(tenant_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_flows_tenant_created ON data_flows(tenant_id, created_at);
 """
 
 def init_db():

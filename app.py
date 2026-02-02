@@ -6,8 +6,8 @@ st.set_page_config(page_title="CUI Inspector (Multi-Tenant)", page_icon="🔒", 
 
 def main():
     init_db()
-    st.title("🔒 CUI Inspector – Complete Multi-Tenant")
-    st.caption("Multi-tenant + restored document analysis + evidence vault + integrity verification + export manifests.")
+    st.title("🔒 CUI Inspector – Multi-Tenant")
+    st.caption("Multi-tenant + evidence vault + integrity verify + search/compare + manifest + data flow mapper.")
     render_pages()
 
 if __name__ == "__main__":
