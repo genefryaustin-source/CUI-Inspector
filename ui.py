@@ -11,17 +11,27 @@ from db import init_db
 from evidence_vault import save_inspection, render_evidence_vault
 from search import render_search_page
 from compare import render_compare_page
+from manifest import render_manifest_export  # ✅ Step 8
+
 
 def ensure_session_state():
     for k in ["last_text", "last_meta", "last_analysis", "artifacts"]:
         if k not in st.session_state:
             st.session_state[k] = None
 
+
 def render_sidebar():
     st.sidebar.header("Navigation")
     page = st.sidebar.radio(
         "Go to",
-        ["Document Inspector", "Evidence Vault", "Search", "Compare", "System Info"],
+        [
+            "Document Inspector",
+            "Evidence Vault",
+            "Search",
+            "Compare",
+            "Manifest Export",   # ✅ Step 8
+            "System Info",
+        ],
         key="nav_radio"
     )
 
@@ -35,6 +45,7 @@ def render_sidebar():
     st.sidebar.write(f"Platform: {platform.system()}")
 
     return page
+
 
 def render_document_inspector():
     colA, colB = st.columns([1.2, 0.8], gap="large")
@@ -100,10 +111,12 @@ def render_document_inspector():
             st.subheader("Artifacts")
             artifacts_to_download_buttons(st.session_state.artifacts)
 
+
 def render_system_info():
     st.header("System Info")
     st.write("Python:", sys.version)
     st.write("OCR available:", OCR_AVAILABLE)
+
 
 def render_app():
     init_db()
@@ -118,7 +131,10 @@ def render_app():
         render_search_page()
     elif page == "Compare":
         render_compare_page()
+    elif page == "Manifest Export":
+        render_manifest_export()   # ✅ Step 8
     else:
         render_system_info()
+
 
 
