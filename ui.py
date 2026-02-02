@@ -9,19 +9,20 @@ from analysis_engine import analyze_text
 from artifacts import build_artifacts, artifacts_to_download_buttons
 from db import init_db
 from evidence_vault import save_inspection, render_evidence_vault
-
+from search import render_search_page
+from compare import render_compare_page
 
 def ensure_session_state():
     for k in ["last_text", "last_meta", "last_analysis", "artifacts"]:
         if k not in st.session_state:
             st.session_state[k] = None
 
-
 def render_sidebar():
     st.sidebar.header("Navigation")
     page = st.sidebar.radio(
         "Go to",
-        ["Document Inspector", "Evidence Vault", "System Info"]
+        ["Document Inspector", "Evidence Vault", "Search", "Compare", "System Info"],
+        key="nav_radio"
     )
 
     st.sidebar.divider()
@@ -35,19 +36,18 @@ def render_sidebar():
 
     return page
 
-
 def render_document_inspector():
     colA, colB = st.columns([1.2, 0.8], gap="large")
 
     with colA:
         uploaded = st.file_uploader(
             "Upload a document",
-            type=["pdf", "txt", "docx", "pptx"]
+            type=["pdf", "txt", "docx", "pptx"],
+            key="doc_upload"
         )
 
         if uploaded:
             text = extract_text_from_file(uploaded)
-
             meta = {
                 "filename": uploaded.name,
                 "size_bytes": uploaded.size,
@@ -64,23 +64,20 @@ def render_document_inspector():
             st.json(meta)
 
             st.subheader("Extracted Text (preview)")
-            st.text_area("Preview", text[:8000], height=260)
-        else:
-            st.info("Upload a document to begin.")
+            st.text_area("Preview", text[:8000], height=260, key="preview_text")
 
     with colB:
         st.subheader("Analysis Controls")
 
-        rs_name = st.selectbox("Ruleset", ruleset_names())
+        rs_name = st.selectbox("Ruleset", ruleset_names(), key="ruleset_select")
         st.caption(RULESETS[rs_name]["description"])
 
         can_run = bool((st.session_state.last_text or "").strip())
-        if st.button("▶ Run Analysis", type="primary", disabled=not can_run):
+        if st.button("▶ Run Analysis", type="primary", disabled=not can_run, key="run_analysis"):
             analysis = analyze_text(st.session_state.last_text, rs_name)
             st.session_state.last_analysis = analysis
             st.session_state.artifacts = build_artifacts(
-                st.session_state.last_meta,
-                analysis
+                st.session_state.last_meta, analysis
             )
 
             save_inspection(
@@ -103,12 +100,10 @@ def render_document_inspector():
             st.subheader("Artifacts")
             artifacts_to_download_buttons(st.session_state.artifacts)
 
-
 def render_system_info():
     st.header("System Info")
     st.write("Python:", sys.version)
     st.write("OCR available:", OCR_AVAILABLE)
-
 
 def render_app():
     init_db()
@@ -119,6 +114,11 @@ def render_app():
         render_document_inspector()
     elif page == "Evidence Vault":
         render_evidence_vault()
+    elif page == "Search":
+        render_search_page()
+    elif page == "Compare":
+        render_compare_page()
     else:
         render_system_info()
+
 
