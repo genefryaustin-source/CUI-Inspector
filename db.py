@@ -1,51 +1,44 @@
 import sqlite3
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "cui_inspector.db"
+DB_PATH = Path("cui_inspector.db")
 
-def get_connection():
+def get_db():
     con = sqlite3.connect(DB_PATH, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
 
 def init_db():
-    con = get_connection()
-    cur = con.cursor()
+    con = get_db()
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS inspections (
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS tenants (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        filename TEXT,
-        sha256 TEXT,
-        ruleset TEXT,
-        risk_level TEXT,
-        risk_score INTEGER,
-        analysis_json TEXT,
+        name TEXT UNIQUE NOT NULL,
+        is_active INTEGER DEFAULT 1,
         created_at TEXT
-    )
-    """)
+    );
 
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS artifacts (
+    CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
-        inspection_id INTEGER,
-        name TEXT,
-        sha256 TEXT,
-        content BLOB,
+        email TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        role TEXT NOT NULL,
+        tenant_id INTEGER,
+        is_active INTEGER DEFAULT 1,
         created_at TEXT,
-        FOREIGN KEY (inspection_id) REFERENCES inspections(id)
-    )
-    """)
+        last_login_at TEXT
+    );
 
-    # 🔎 Indexes for Step 7
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_insp_created ON inspections(created_at)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_insp_filename ON inspections(filename)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_insp_sha256 ON inspections(sha256)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_insp_ruleset ON inspections(ruleset)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_insp_risk ON inspections(risk_level)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_art_inspection ON artifacts(inspection_id)")
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_email TEXT,
+        role TEXT,
+        tenant_id INTEGER,
+        action TEXT,
+        target TEXT,
+        timestamp TEXT
+    );
+    """)
 
     con.commit()
-    con.close()
-
-
