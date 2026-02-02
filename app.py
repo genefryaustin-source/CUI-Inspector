@@ -1,5 +1,4 @@
 import streamlit as st
-
 from cui_inspector.ui import render_app
 
 st.set_page_config(
