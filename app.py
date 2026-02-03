@@ -3,13 +3,13 @@ from pathlib import Path
 import streamlit as st
 
 # -------------------------------------------------
-# Streamlit Cloud: ensure local modules resolve
+# Add PROJECT ROOT (parent of cui-inspector)
 # -------------------------------------------------
-ROOT = Path(__file__).parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-from ui import render_app  # ← LOCAL import, not package
+from ui import render_app  # now resolves correctly
 
 st.set_page_config(
     page_title="CUI Inspector – Multi-Tenant",
@@ -18,5 +18,6 @@ st.set_page_config(
 
 if __name__ == "__main__":
     render_app()
+
 
 

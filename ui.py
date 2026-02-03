@@ -3,11 +3,11 @@ from pathlib import Path
 import streamlit as st
 
 # -------------------------------------------------
-# Ensure local sibling modules resolve (CRITICAL)
+# Ensure PROJECT ROOT is on path (CRITICAL)
 # -------------------------------------------------
-ROOT = Path(__file__).parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from db import init_db
 from auth import render_login, require_login, logout
@@ -21,10 +21,6 @@ from search import render_search_page
 from compare import render_compare_page
 from manifest import render_manifest_export
 
-
-# -------------------------------------------------
-# Sidebar
-# -------------------------------------------------
 
 def render_sidebar(user):
     st.sidebar.markdown(
@@ -52,32 +48,22 @@ def render_sidebar(user):
     )
 
 
-# -------------------------------------------------
-# App Entrypoint
-# -------------------------------------------------
-
 def render_app():
     init_db()
 
-    # ---- Auth gate
     if not require_login():
         render_login()
         return
 
     user = st.session_state.user
-
-    # ---- Tenant enforcement
     ensure_active_tenant()
 
-    # ---- Navigation
     page = render_sidebar(user)
 
-    # ---- RBAC guard
     if is_read_only(user["role"]) and page == "Document Inspector":
         st.warning("🔍 Auditor access is read-only. Uploads are disabled.")
         return
 
-    # ---- Pages
     if page == "Document Inspector":
         render_document_inspector()
         log_event(user, "document_inspection")
@@ -95,8 +81,6 @@ def render_app():
         render_manifest_export()
         log_event(user, "manifest_export")
 
-    else:
-        st.info("Select a page from the sidebar.")
 
 
 
